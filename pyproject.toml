@@ -1,0 +1,11 @@
+[project]
+name = "idbd-optimizer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.3",
+    "seaborn>=0.13.2",
+    "torch>=2.14.1",
+]

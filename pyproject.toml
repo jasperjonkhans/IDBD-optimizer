@@ -5,8 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "matplotlib>=3.11.2",
+    "mlflow>=3.17.0",
     "nbformat>=5.11.1",
     "numpy>=2.5.3",
+    "pandas>=3.0.6",
     "seaborn>=0.13.2",
     "tensorboard>=2.21.0",
     "torch>=2.14.1",

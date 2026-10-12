@@ -39,6 +39,21 @@ def duration(seconds):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def weight_metrics(model, optimizer):
+    weights = model.weight.detach().flatten()
+    rates = (optimizer.state[model.weight]["beta"].exp().flatten()
+             if isinstance(optimizer, IDBD)
+             else torch.full_like(weights, optimizer.param_groups[0]["lr"]))
+    return dict(
+        useful_weight=weights[0].item(),
+        distractor_weight_rms=(weights[1:].square().mean().sqrt().item()
+                               if weights.numel() > 1 else 0.0),
+        useful_lr=rates[0].item(),
+        distractor_lr_mean=(rates[1:].mean().item()
+                            if rates.numel() > 1 else rates[0].item()),
+    )
+
+
 def run_config(args, initial_lr, meta_lr, report):
     models = {name: nn.Linear(args.input_dim, 1, bias=False)
               for name in ("IDBD", "SGD")}
@@ -98,11 +113,17 @@ def run_config(args, initial_lr, meta_lr, report):
                     totals[name]["clean"] += clean_error.square().sum().item()
                     totals[name]["active"] += clean_error[active].square().sum().item()
             report(phase, step, steps, models, optimizers, losses)
-    return [dict(model=name, noisy_mse=t["noisy"] / examples,
-                 clean_mse=t["clean"] / examples,
-                 active_clean_mse=t["active"] / active_examples if active_examples else "",
-                 test_examples=examples, active_examples=active_examples)
-            for name, t in totals.items()]
+    rows = []
+    for name, t in totals.items():
+        # Frozen final weights/rates; the zero baseline has no optimizer.
+        metrics = (weight_metrics(models[name], optimizers[name]) if name in models
+                   else dict(useful_weight=0.0, distractor_weight_rms=0.0,
+                             useful_lr="", distractor_lr_mean=""))
+        rows.append(dict(model=name, noisy_mse=t["noisy"] / examples,
+                         clean_mse=t["clean"] / examples,
+                         active_clean_mse=t["active"] / active_examples if active_examples else "",
+                         test_examples=examples, active_examples=active_examples, **metrics))
+    return rows
 
 
 def main():
@@ -126,7 +147,9 @@ def main():
     completed = 0
     start = time.perf_counter()
     fields = ["initial_lr", "meta_lr", "seed", "model", "status", "noisy_mse",
-              "clean_mse", "active_clean_mse", "test_examples", "active_examples", "seconds", "error"]
+              "clean_mse", "active_clean_mse", "test_examples", "active_examples",
+              "useful_weight", "distractor_weight_rms", "useful_lr", "distractor_lr_mean",
+              "seconds", "error"]
     print(f"{len(configs)} Läufe, je {args.steps} Trainingsupdates (Batch {args.batch_size}), "
           f"{args.test_steps} Testbatches. CPU, {args.threads} Thread(s).", flush=True)
     print("Restzeiten sind Schätzungen aus der bisherigen Geschwindigkeit; erste Schätzung nach Update 1.",
@@ -155,14 +178,11 @@ def main():
                       f"Rest Lauf ~{duration(run_elapsed / run_done * (per_run - run_done))} | "
                       f"Rest gesamt ~{duration(elapsed / completed * (planned - completed))}", flush=True)
                 for name, model in models.items():
-                    weights = model.weight.detach().flatten()
-                    state = optimizers[name].state[model.weight]
-                    rates = state["beta"].exp().flatten() if name == "IDBD" else torch.full_like(weights, initial_lr)
-                    rms = weights[1:].square().mean().sqrt().item() if weights.numel() > 1 else 0.0
-                    lr_mean = rates[1:].mean().item() if rates.numel() > 1 else rates[0].item()
-                    print(f"{name}: loss={losses[name]:.5g}, w[0]={weights[0].item():.5g}, "
-                          f"distractor_rms={rms:.5g}, lr[0]={rates[0].item():.5g}, "
-                          f"distractor_lr={lr_mean:.5g}", flush=True)
+                    metrics = weight_metrics(model, optimizers[name])
+                    print(f"{name}: loss={losses[name]:.5g}, w[0]={metrics['useful_weight']:.5g}, "
+                          f"distractor_rms={metrics['distractor_weight_rms']:.5g}, "
+                          f"lr[0]={metrics['useful_lr']:.5g}, "
+                          f"distractor_lr={metrics['distractor_lr_mean']:.5g}", flush=True)
                 last_log = time.perf_counter()
 
             try:

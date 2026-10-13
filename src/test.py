@@ -1,5 +1,9 @@
-from main import train
-from helper import DataStream
+if __package__:
+    from .main import train
+    from .data import DataStream
+else:
+    from main import train
+    from data import DataStream
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -11,9 +15,9 @@ def main() -> None:
     mlflow.set_experiment("input_dim_step_cnt")
     seed = 1234
     tolerance_intervall = 1e-3
-    stop_condition = lambda step, name, values: (
-        values["distractor_weight_rms"] < tolerance_intervall
-    )
+
+    def stop_condition(step, name, values):
+        return values["distractor_weight_rms"] < tolerance_intervall
 
     initial_lr = 0.01
     meta_lr = 0.01

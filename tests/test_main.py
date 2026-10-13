@@ -15,19 +15,20 @@ from PIL import Image
 import torch
 from torch import nn
 
-import main
-from helper import DataStream
+from src import main
+from src.data import DataStream
+from src.optim import IDBD
 
 
 class TrainingTests(unittest.TestCase):
     def test_training_matches_notebook(self):
         # Execute the notebook's actual train() without its long experiment.
         notebook = json.loads(
-            (Path(main.__file__).parent / "sgd_idbd_exercise.ipynb").read_text()
+            (Path(main.__file__).parents[1] / "notebooks" / "sgd_idbd_exercise.ipynb").read_text()
         )
         source = next("".join(cell["source"]) for cell in notebook["cells"]
                       if "def train(dataset," in "".join(cell["source"]))
-        namespace = dict(torch=torch, nn=nn, pd=pd, copy=main.copy)
+        namespace = dict(torch=torch, nn=nn, pd=pd, copy=main.copy, IDBD=IDBD)
         exec(source.split("train_stream =")[0], namespace)
         with contextlib.redirect_stdout(io.StringIO()):
             torch.manual_seed(1234)
@@ -108,6 +109,39 @@ class TrainingTests(unittest.TestCase):
             main.learning_rates(models["IDBD"], optimizers["IDBD"]),
             torch.full((4,), 0.01),
         )
+
+    def test_bounded_history_and_progress_callbacks_preserve_results(self):
+        with patch.object(main.mlflow, "log_metrics"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            torch.manual_seed(1234)
+            expected_models, _, history, expected_metrics, predictions = main.train(
+                DataStream(input_dim=4), 5, 3, 0.01, 0.1
+            )
+            calls = []
+            torch.manual_seed(1234)
+            models, _, empty_history, metrics, empty_predictions = main.train(
+                DataStream(input_dim=4), 5, 3, 0.01, 0.1,
+                record_history=False,
+                progress_callback=lambda step, values: calls.append((step, values)),
+            )
+        self.assertTrue(empty_history.empty)
+        self.assertTrue(empty_predictions.empty)
+        self.assertFalse(history.empty)
+        self.assertFalse(predictions.empty)
+        pd.testing.assert_frame_equal(metrics, expected_metrics)
+        for name in models:
+            torch.testing.assert_close(models[name].weight, expected_models[name].weight)
+        self.assertEqual([step for step, _ in calls], [1, 2, 3, 4, 5])
+        for step, values in calls:
+            for name, row_values in values.items():
+                row = history[(history["update"] == step) & (history["model"] == name)].iloc[0]
+                for key, value in row_values.items():
+                    self.assertEqual(value, row[key])
+        evaluation_calls = []
+        main.evaluate(models, DataStream(input_dim=4), 2, 3,
+                      progress_callback=lambda step, values: evaluation_calls.append((step, values)))
+        self.assertEqual([step for step, _ in evaluation_calls], [1, 2])
+        self.assertEqual(set(evaluation_calls[0][1]), {"IDBD", "SGD"})
 
     def test_evaluation_is_frozen_and_metrics_are_correct(self):
         model = nn.Linear(2, 1, bias=False)

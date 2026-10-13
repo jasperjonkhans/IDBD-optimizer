@@ -1,3 +1,5 @@
+"""Incremental Delta-Bar-Delta for linear predictors with per-weight step sizes."""
+
 import math
 
 import torch
@@ -7,6 +9,14 @@ from torch.optim.optimizer import ParamsT
 
 
 class IDBD(Optimizer):
+    """Adapt log learning rates and sensitivity traces for linear weights.
+
+    Backpropagate mean half-squared error, then call ``step(x)`` with the same
+    feature vector or batch. Parameters must be feature-aligned linear weights
+    (no bias); optimizer state stores ``beta`` and ``h`` per weight.
+    Setting ``meta_lr=0`` recovers SGD at ``initial_lr``.
+    """
+
     def __init__(
         self,
         params: ParamsT,
@@ -53,8 +63,11 @@ class IDBD(Optimizer):
             hs: list[Tensor] = []
 
             self._init_group(group, params, grads, betas, hs)
-            idbd(params, grads, betas, hs, x, float(group["meta_lr"]))
+            self._update_group(group, params, grads, betas, hs, x)
         return loss
+
+    def _update_group(self, group, params, grads, betas, hs, x):
+        idbd(params, grads, betas, hs, x, float(group["meta_lr"]))
 
 
 def idbd(
@@ -64,8 +77,14 @@ def idbd(
     hs: list[Tensor],
     x: Tensor,
     meta_lr: float,
+    *,
+    beta_momentum: float = 0.0,
+    beta_momentum_buffers: list[Tensor] | None = None,
 ) -> None:
-    _single_tensor_idbd(params, grads, betas, hs, x, meta_lr)
+    _single_tensor_idbd(
+        params, grads, betas, hs, x, meta_lr,
+        beta_momentum=beta_momentum, beta_momentum_buffers=beta_momentum_buffers,
+    )
 
 
 def _single_tensor_idbd(
@@ -75,7 +94,14 @@ def _single_tensor_idbd(
     hs: list[Tensor],
     x: Tensor,
     meta_lr: float,
+    *,
+    beta_momentum: float = 0.0,
+    beta_momentum_buffers: list[Tensor] | None = None,
 ) -> None:
+    if beta_momentum != 0 and (
+        beta_momentum_buffers is None or len(beta_momentum_buffers) != len(params)
+    ):
+        raise ValueError("beta momentum requires one buffer per parameter")
     if x.ndim not in (1, 2):
         raise ValueError("x must have shape (features,) or (batch, features)")
     if x.numel() == 0:
@@ -87,13 +113,19 @@ def _single_tensor_idbd(
     if x.ndim == 2:
         feature_curvature = feature_curvature.mean(dim=0)
 
-    for param, grad, beta, h in zip(params, grads, betas, hs):
+    for i, (param, grad, beta, h) in enumerate(zip(params, grads, betas, hs)):
         curvature = feature_curvature.to(device=param.device, dtype=param.dtype)
         if param.numel() == curvature.numel():
             curvature = curvature.reshape_as(param)
         else:
             curvature = curvature.expand_as(param)
-        beta.addcmul_(grad, h, value=-meta_lr)
+        if beta_momentum == 0:
+            beta.addcmul_(grad, h, value=-meta_lr)
+        else:
+            # Heavy-ball momentum on the beta descent direction only.
+            velocity = beta_momentum_buffers[i]
+            velocity.mul_(beta_momentum).addcmul_(grad, h, value=-1)
+            beta.add_(velocity, alpha=meta_lr)
         alpha = beta.exp()
         update = alpha * grad
         param.sub_(update)

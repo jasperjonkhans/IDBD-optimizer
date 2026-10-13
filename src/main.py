@@ -13,8 +13,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from helper import DataStream
-from idbd_exercise import IDBD
+if __package__:
+    from .data import DataStream
+    from .optim import IDBD
+else:  # Also support `python src/main.py`.
+    from data import DataStream
+    from optim import IDBD
 
 plt.switch_backend("Agg")  # Save plots without opening windows (also works headlessly).
 
@@ -76,7 +80,8 @@ def learning_rates(model, optimizer):
 
 
 def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
-          stop_condition=None, zeros=False):
+          stop_condition=None, zeros=False, *, progress_callback=None,
+          record_history=True):
     """Train for at most ``iterations`` updates on the shared data stream.
 
     If provided, ``stop_condition(step, name, metrics)`` is checked after each
@@ -85,7 +90,10 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
     Both models continue training until both have reached the criterion.
     The returned training metrics then include ``steps_to_target``: the first
     matching update, or None if not reached (also None for the Zero baseline).
-    Without a callback, the return values and fixed-budget behavior are unchanged.
+    Without a stop callback, fixed-budget behavior is unchanged.
+    ``progress_callback(step, metrics_by_model)`` receives one report per update.
+    Set ``record_history=False`` for sweeps to keep memory usage bounded; history
+    and final predictions are then empty, but training metrics are unchanged.
     """
     # Same random initial weights for both models, as in the notebook's train().
     idbd_model = nn.Linear(dataset.input_dim, 1, bias=False)
@@ -109,6 +117,7 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
     for step, (x, noisy_y, clean_y) in enumerate(islice(loader, iterations), start=1):
         predictions = {}
         step_metrics = {}
+        metrics_by_model = {}
         for name, model in models.items():
             optimizer = optimizers[name]
             optimizer.zero_grad(set_to_none=True)
@@ -146,8 +155,10 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
                     "lr_min": rates.min().item(),
                     "lr_max": rates.max().item(),
                 }
-            history.append({"model": name, "update": step,
-                            "examples": examples_seen + len(x), **values})
+            metrics_by_model[name] = values
+            if record_history:
+                history.append({"model": name, "update": step,
+                                "examples": examples_seen + len(x), **values})
             step_metrics.update({f"train.{name}.{key}": value
                                  for key, value in values.items()})
             if (stop_condition is not None and steps_to_target[name] is None
@@ -155,13 +166,14 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
                 steps_to_target[name] = step
 
         accumulate_metrics(totals["Zero"], torch.zeros_like(clean_y), noisy_y, clean_y)
-        for i in range(len(x)):
-            last_predictions.append({
-                "example": examples_seen + i + 1,
-                "clean_target": clean_y[i].item(),
-                "noisy_target": noisy_y[i].item(),
-                **{name: prediction[i].item() for name, prediction in predictions.items()},
-            })
+        if record_history:
+            for i in range(len(x)):
+                last_predictions.append({
+                    "example": examples_seen + i + 1,
+                    "clean_target": clean_y[i].item(),
+                    "noisy_target": noisy_y[i].item(),
+                    **{name: prediction[i].item() for name, prediction in predictions.items()},
+                })
         examples_seen += len(x)
 
         all_reached = (stop_condition is not None
@@ -169,8 +181,11 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
         if step == 1 or step % log_every == 0 or step == iterations or all_reached:
             mlflow.log_metrics(step_metrics, step=step)
             log_summary(summarize_metrics(totals), "train", step)
+        if progress_callback is not None:
+            progress_callback(step, metrics_by_model)
         progress = step / iterations * 100
-        if progress >= next_report or step == iterations or all_reached:
+        if (progress_callback is None
+                and (progress >= next_report or step == iterations or all_reached)):
             print(f"Training {progress:.0f}%: {examples_seen} examples, "
                   f"IDBD loss={step_metrics['train.IDBD.loss']:.4f}, "
                   f"SGD loss={step_metrics['train.SGD.loss']:.4f}")
@@ -188,20 +203,28 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
 
 
 @torch.no_grad()
-def evaluate(models, dataset, iterations, batch_size):
+def evaluate(models, dataset, iterations, batch_size, *, progress_callback=None):
+    """Evaluate frozen weights; optionally report per-batch losses to a callback."""
     totals = {name: metric_totals() for name in (*models, "Zero")}
     loader = DataLoader(dataset, batch_size=batch_size, num_workers=0)
     training_modes = {name: model.training for name, model in models.items()}
     try:
         for model in models.values():
             model.eval()
-        for x, noisy_y, clean_y in islice(loader, iterations):
+        for step, (x, noisy_y, clean_y) in enumerate(islice(loader, iterations), start=1):
+            metrics_by_model = {}
             for name, model in models.items():
                 prediction = model(x).squeeze(-1)
                 if not torch.isfinite(prediction).all().item():
                     raise FloatingPointError(f"{name}: non-finite test prediction")
                 accumulate_metrics(totals[name], prediction, noisy_y, clean_y)
+                if progress_callback is not None:
+                    metrics_by_model[name] = {
+                        "loss": 0.5 * (prediction - noisy_y).square().mean().item()
+                    }
             accumulate_metrics(totals["Zero"], torch.zeros_like(clean_y), noisy_y, clean_y)
+            if progress_callback is not None:
+                progress_callback(step, metrics_by_model)
     finally:
         for name, model in models.items():
             model.train(training_modes[name])

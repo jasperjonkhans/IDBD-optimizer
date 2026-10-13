@@ -1,4 +1,9 @@
 __pycache__/
 .venv/
 .ruff_cache/
-/mlflow.db*
+
+# Live MLflow databases are local; share tracking/mlflow.db.gz instead.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal

@@ -23,7 +23,8 @@ binary features and noisy targets. Run commands from the repository root.
 
 Open `notebooks/idbd_momentum.ipynb` using this project's Python environment and
 run all cells from the repository root or `notebooks/`. It compares SGD, IDBD
-and IDBDMomentum on identical initial weights and batches, without MLflow.
+and IDBDMomentum on identical initial weights and batches, using `src.main.train()`,
+`evaluate()` and `learning_rates()` without MLflow (`log_mlflow=False`).
 Plots show distractor weight RMS, individual distractor weights/rates, learning
 rate quantiles and final distributions, useful-feature behavior and independent
 clean-target test errors. Settings are in the configuration cell; history is
@@ -42,6 +43,26 @@ long run. Enable `RUN_MATCHED_META_LR` for a second comparison that reduces only
 the momentum variant's meta learning rate by `1 - beta_momentum`. This separates
 long-run amplification from the memory effect, but does not equate transients.
 Faster rate shrinkage is not itself evidence of better weights or test error.
+
+## Shared training API
+
+`train(dataset, iterations, batch_size, models, optimizers, ...)` accepts named
+model and optimizer dictionaries with identical, nonempty keys. Create and
+initialize models outside training, then bind each optimizer to its corresponding
+model's parameters. The experiment expects scalar linear predictors without bias,
+with feature 0 useful and at least one distractor. Names are arbitrary except
+`Zero`, reserved for the automatic baseline. IDBD subclasses (including
+IDBDMomentum) use `step(x)`; other PyTorch optimizers use `step()`.
+
+`create_comparison(input_dim, initial_lr, meta_lr, zeros=False)` builds the default
+IDBD/SGD pair with identical initial weights (`zeros` is keyword-only). Custom
+comparisons can supply their own dictionaries. Learning rates and initialization
+are no longer arguments of `train()`. Its five return values remain
+`models, optimizers, history, train_metrics, predictions`; the first two are the
+supplied dictionaries, updated in place, so training can resume with existing
+optimizer state. `stop_condition` waits until all supplied models meet the target.
+Use `log_mlflow=False` without tracking; importing `src.main` leaves the plotting
+backend unchanged.
 
 ## Single comparison
 
@@ -84,8 +105,62 @@ for training. Both entry points accept `--tracking-uri` and `--experiment`.
 uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
+## Setup
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run from the repository root:
+
+```sh
+git clone git@github.com:jasperjonkhans/IDBD-optimizer.git
+cd IDBD-optimizer
+uv sync --locked
+```
+
+`uv` installs the Python version selected in `.python-version` (Python 3.14) and dependencies from `uv.lock`. Do not copy another contributor's `.venv`.
+
+## View the shared MLflow runs
+
+The repository contains a compressed SQLite snapshot in `tracking/mlflow.db.gz` and the corresponding CSV/plot artifacts in `mlruns/`. Import once after cloning:
+
+```sh
+uv run python scripts/mlflow_snapshot.py import
+uv run mlflow ui --backend-store-uri sqlite:///mlflow.db --host 127.0.0.1 --port 5000
+```
+
+Open http://127.0.0.1:5000 and select `SGD-vs-IDBD`. You can inspect parameters, metric histories, CSVs and plots. The import resolves artifact paths to your checkout, so paths from the author's computer are not required. Keep the checkout in place while viewing runs.
+
+The snapshot captures run statuses at export time, including failed or still-running runs; it is not a live tracking service. Runs without logged artifacts have no artifact files to display.
+
+Import refuses to overwrite an existing database. To view an updated snapshot without losing your own runs:
+
+```sh
+uv run python scripts/mlflow_snapshot.py import --database shared.db
+uv run mlflow ui --backend-store-uri sqlite:///shared.db --host 127.0.0.1 --port 5001
+```
+
+Use a new database filename for each import, or explicitly back up and remove an old local copy first. Local databases are ignored by Git.
+
 ## Tests
+
+`uv run python -m src.test` runs the longer input-dimension stopping-condition
+experiment, not the unit tests.
+
+Unit tests:
 
 ```sh
 uv run python -m unittest discover -s tests -v
 ```
+
+## Share updated results
+
+After training has finished, stop any writers before exporting and committing. Export uses SQLite's backup API and does not modify your live database:
+
+```sh
+uv run python scripts/mlflow_snapshot.py export
+git add tracking/mlflow.db.gz mlruns/
+git commit -m "Update shared MLflow runs"
+git push origin main
+```
+
+The snapshot contains all database runs/metrics/parameters/tags. Review them and all artifacts before publishing; do not log credentials or sensitive data. The exporter replaces machine-specific artifact paths with portable paths. Other recorded metadata, such as user names and source tags, is preserved.
+
+Snapshot and artifacts must be published together. GitHub rejects individual files over 100 MiB; the exporter refuses compressed snapshots at 95 MiB. If results grow beyond that, switch to Git LFS or a shared tracking server. The snapshot is a full copy, not a merge mechanism for contributor databases.

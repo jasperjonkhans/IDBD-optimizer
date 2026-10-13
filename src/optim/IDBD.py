@@ -102,23 +102,9 @@ def _single_tensor_idbd(
         beta_momentum_buffers is None or len(beta_momentum_buffers) != len(params)
     ):
         raise ValueError("beta momentum requires one buffer per parameter")
-    if x.ndim not in (1, 2):
-        raise ValueError("x must have shape (features,) or (batch, features)")
-    if x.numel() == 0:
-        raise ValueError("x must contain at least one example and feature")
-
-    # The diagonal curvature of mean half-squared error is E[x_i ** 2],
-    # not E[x_i] ** 2. Keep optimizer state per weight, not per example.
-    feature_curvature = x.square()
-    if x.ndim == 2:
-        feature_curvature = feature_curvature.mean(dim=0)
+    feature_curvature = _feature_curvature(x)
 
     for i, (param, grad, beta, h) in enumerate(zip(params, grads, betas, hs)):
-        curvature = feature_curvature.to(device=param.device, dtype=param.dtype)
-        if param.numel() == curvature.numel():
-            curvature = curvature.reshape_as(param)
-        else:
-            curvature = curvature.expand_as(param)
         if beta_momentum == 0:
             beta.addcmul_(grad, h, value=-meta_lr)
         else:
@@ -126,7 +112,29 @@ def _single_tensor_idbd(
             velocity = beta_momentum_buffers[i]
             velocity.mul_(beta_momentum).addcmul_(grad, h, value=-1)
             beta.add_(velocity, alpha=meta_lr)
-        alpha = beta.exp()
-        update = alpha * grad
-        param.sub_(update)
-        h.mul_((1 - alpha * curvature).clamp_min_(0)).sub_(update)
+        _update_weight_and_trace(param, grad, beta, h, feature_curvature)
+
+
+def _feature_curvature(x: Tensor) -> Tensor:
+    if x.ndim not in (1, 2):
+        raise ValueError("x must have shape (features,) or (batch, features)")
+    if x.numel() == 0:
+        raise ValueError("x must contain at least one example and feature")
+
+    # The diagonal curvature is E[x_i ** 2], not E[x_i] ** 2.
+    curvature = x.square()
+    return curvature.mean(dim=0) if x.ndim == 2 else curvature
+
+
+def _update_weight_and_trace(
+    param: Tensor, grad: Tensor, beta: Tensor, h: Tensor, feature_curvature: Tensor,
+) -> None:
+    curvature = feature_curvature.to(device=param.device, dtype=param.dtype)
+    if param.numel() == curvature.numel():
+        curvature = curvature.reshape_as(param)
+    else:
+        curvature = curvature.expand_as(param)
+    alpha = beta.exp()
+    update = alpha * grad
+    param.sub_(update)
+    h.mul_((1 - alpha * curvature).clamp_min_(0)).sub_(update)

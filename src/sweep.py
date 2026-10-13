@@ -73,11 +73,14 @@ def run_config(args, initial_lr, meta_lr, report):
     """Run one comparison inside the caller's active MLflow run."""
     # Same initial weights and fresh identical streams for every configuration.
     torch.manual_seed(args.seed)
+    models, optimizers = experiment.create_comparison(
+        args.input_dim, initial_lr, meta_lr, zeros=args.zeros,
+    )
     models, optimizers, _, train_metrics, _ = experiment.train(
         DataStream(input_dim=args.input_dim, seed=args.seed),
         iterations=args.iterations, batch_size=args.batch_size,
-        initial_lr=initial_lr, meta_lr=meta_lr, log_every=args.log_every,
-        zeros=args.zeros, record_history=False,
+        models=models, optimizers=optimizers, log_every=args.log_every,
+        record_history=False,
         progress_callback=lambda step, values: report(
             "train", step, args.iterations, values
         ),
@@ -134,7 +137,7 @@ def parse_args(argv=None):
     parser.add_argument("--log-every", type=positive_int, default=100)
     parser.add_argument("--log-seconds", type=positive_float, default=5)
     parser.add_argument("--threads", type=positive_int, default=1, help="PyTorch CPU threads")
-    parser.add_argument("--tracking-uri", default="sqlite:///mlflow.db")
+    parser.add_argument("--tracking-uri", default="http://100.96.85.78:5000")
     parser.add_argument("--experiment", default="SGD-vs-IDBD")
     parser.add_argument("--output", type=Path, default=Path("sweep_results.csv"))
     args = parser.parse_args(argv)

@@ -1,8 +1,8 @@
 if __package__:
-    from .main import train
+    from .main import create_comparison, train
     from .data import DataStream
 else:
-    from main import train
+    from main import create_comparison, train
     from data import DataStream
 
 import matplotlib.pyplot as plt
@@ -12,6 +12,7 @@ import torch
 
 
 def main() -> None:
+    mlflow.set_tracking_uri("http://100.96.85.78:5000")
     mlflow.set_experiment("input_dim_step_cnt")
     seed = 1234
     tolerance_intervall = 1e-3
@@ -42,10 +43,11 @@ def main() -> None:
             with mlflow.start_run(run_name=f"input_dim={input_dim}", nested=True):
                 torch.manual_seed(seed)
                 mlflow.log_param("input_dim", input_dim)
+                models, optimizers = create_comparison(input_dim, initial_lr, meta_lr)
                 models, optimizers, history, train_metrics, predictions = train(
                     DataStream(input_dim=input_dim, seed=seed),
                     iterations=max_iterations, batch_size=batch_size,
-                    meta_lr=meta_lr, initial_lr=initial_lr,
+                    models=models, optimizers=optimizers,
                     stop_condition=stop_condition,
                 )
 

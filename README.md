@@ -98,12 +98,12 @@ Direct script execution also works: `uv run python src/main.py` or
 
 ## MLflow
 
-The default tracking URI is `sqlite:///mlflow.db`; no tracking server is required
-for training. Both entry points accept `--tracking-uri` and `--experiment`.
-
-```sh
-uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
-```
+The default tracking URI is `http://100.96.85.78:5000`. The tracking server must
+be reachable during training; open the same URL to view runs in the MLflow UI.
+`src.main` and `src.sweep` accept `--tracking-uri` and `--experiment` overrides.
+The input-dimension script and notebook also use this tracking server.
+Local tracking databases and artifacts (`mlflow.db*`, `mlruns/`, `mlartifacts/`)
+are ignored by Git and are not kept as repository snapshots.
 
 ## Setup
 

@@ -17,10 +17,86 @@ from torch import nn
 
 from src import main
 from src.data import DataStream
-from src.optim import IDBD
+from src.optim import IDBD, IDBDMomentum
 
 
 class TrainingTests(unittest.TestCase):
+    def test_supplied_models_and_optimizer_types_ignore_names(self):
+        model = nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            model.weight.copy_(torch.tensor([[0.4, -0.2]]))
+        models = {name: main.copy.deepcopy(model) for name in ("IDBD", "adaptive", "momentum")}
+        optimizers = {
+            "IDBD": torch.optim.SGD(models["IDBD"].parameters(), lr=0.05),
+            "adaptive": IDBD(models["adaptive"].parameters(), initial_lr=0.05, meta_lr=0.1),
+            "momentum": IDBDMomentum(models["momentum"].parameters(),
+                                     initial_lr=0.05, meta_lr=0.1, beta_momentum=0.9),
+        }
+        expected = main.copy.deepcopy((models, optimizers))
+
+        def sample(rng, input_dim):
+            return torch.ones(input_dim), torch.tensor(2.0), torch.tensor(1.0)
+
+        for _ in range(4):
+            for name, expected_model in expected[0].items():
+                optimizer = expected[1][name]
+                optimizer.zero_grad(set_to_none=True)
+                loss = 0.5 * (expected_model(torch.ones(3, 2)).squeeze(-1) - 2).square().mean()
+                loss.backward()
+                if isinstance(optimizer, IDBD):
+                    optimizer.step(torch.ones(3, 2))
+                else:
+                    optimizer.step()
+        with patch.object(main.mlflow, "log_metrics") as log, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            result = main.train(DataStream(2, sample_fn=sample), 4, 3, models, optimizers,
+                                log_mlflow=False)
+        self.assertIs(result[0], models)
+        self.assertIs(result[1], optimizers)
+        self.assertEqual(result[2]["model"].unique().tolist(), list(models))
+        self.assertEqual(result[3].index.tolist(), [*models, "Zero"])
+        self.assertAlmostEqual(result[2].iloc[0]["loss"], 0.5 * 1.8**2, places=6)
+        self.assertIn("momentum loss=", output.getvalue())
+        log.assert_not_called()
+        for name in models:
+            torch.testing.assert_close(models[name].weight, expected[0][name].weight)
+            torch.testing.assert_close(main.learning_rates(models[name], optimizers[name]),
+                                       main.learning_rates(expected[0][name], expected[1][name]))
+        self.assertIn("beta_momentum_buffer", optimizers["momentum"].state[models["momentum"].weight])
+
+    def test_training_reuses_optimizer_state_across_calls(self):
+        models, optimizers = main.create_comparison(4, 0.01, 0.1)
+        expected_models, expected_optimizers = main.copy.deepcopy((models, optimizers))
+        stream = DataStream(4)
+        with contextlib.redirect_stdout(io.StringIO()):
+            main.train(DataStream(4), 6, 3, expected_models, expected_optimizers, log_mlflow=False)
+            main.train(stream, 3, 3, models, optimizers, log_mlflow=False)
+            main.train(stream, 3, 3, models, optimizers, log_mlflow=False)
+        for name in models:
+            torch.testing.assert_close(models[name].weight, expected_models[name].weight)
+        for key in ("beta", "h"):
+            torch.testing.assert_close(optimizers["IDBD"].state[models["IDBD"].weight][key],
+                                       expected_optimizers["IDBD"].state[expected_models["IDBD"].weight][key])
+
+    def test_invalid_model_optimizer_names(self):
+        models, optimizers = main.create_comparison(2, 0.01, 0.1)
+        for supplied_models, supplied_optimizers in (
+            ({}, {}), (models, {}),
+            ({"Zero": models["SGD"]}, {"Zero": optimizers["SGD"]}),
+        ):
+            with self.subTest(names=list(supplied_models)), self.assertRaises(ValueError):
+                main.train(DataStream(2), 1, 1, supplied_models, supplied_optimizers,
+                           log_mlflow=False)
+
+    def test_learning_rates_before_first_update_and_zero_initialization(self):
+        models, optimizers = main.create_comparison(4, 0.02, 0.1, zeros=True)
+        for name in models:
+            torch.testing.assert_close(models[name].weight, torch.zeros(1, 4))
+            torch.testing.assert_close(main.learning_rates(models[name], optimizers[name]),
+                                       torch.full((4,), 0.02))
+            self.assertFalse(optimizers[name].state)
+        self.assertIsNot(models["IDBD"].weight, models["SGD"].weight)
+
     def test_training_matches_notebook(self):
         # Execute the notebook's actual train() without its long experiment.
         notebook = json.loads(
@@ -38,7 +114,8 @@ class TrainingTests(unittest.TestCase):
             torch.manual_seed(1234)
             with patch.object(main.mlflow, "log_metrics"):
                 models, _, history, metrics, predictions = main.train(
-                    DataStream(input_dim=4), 8, 32, 0.01, 0.1, log_every=3
+                    DataStream(input_dim=4), 8, 32,
+                    *main.create_comparison(4, 0.01, 0.1), log_every=3
                 )
         for name in models:
             torch.testing.assert_close(models[name].weight, expected_models[name].weight)
@@ -56,7 +133,7 @@ class TrainingTests(unittest.TestCase):
         with patch.object(main.mlflow, "log_metrics") as log, \
                 contextlib.redirect_stdout(io.StringIO()):
             _, _, history, metrics, predictions = main.train(
-                DataStream(input_dim=4), 10, 3, 0.01, 0.1,
+                DataStream(input_dim=4), 10, 3, *main.create_comparison(4, 0.01, 0.1),
                 log_every=7, stop_condition=stop_condition,
             )
         self.assertEqual(metrics["steps_to_target"].to_dict(),
@@ -78,7 +155,7 @@ class TrainingTests(unittest.TestCase):
         with patch.object(main.mlflow, "log_metrics"), \
                 contextlib.redirect_stdout(io.StringIO()):
             _, _, history, metrics, _ = main.train(
-                DataStream(input_dim=4), 5, 3, 0.01, 0.1,
+                DataStream(input_dim=4), 5, 3, *main.create_comparison(4, 0.01, 0.1),
                 stop_condition=lambda step, name, values: name == "IDBD",
             )
         self.assertEqual(metrics["steps_to_target"].to_dict(),
@@ -90,7 +167,7 @@ class TrainingTests(unittest.TestCase):
         with patch.object(main.mlflow, "log_metrics"), \
                 contextlib.redirect_stdout(io.StringIO()):
             _, _, history, metrics, _ = main.train(
-                DataStream(input_dim=4), 5, 3, 0.01, 0.1,
+                DataStream(input_dim=4), 5, 3, *main.create_comparison(4, 0.01, 0.1),
                 stop_condition=lambda step, name, values: True,
             )
         self.assertEqual(metrics["steps_to_target"].to_dict(),
@@ -102,7 +179,7 @@ class TrainingTests(unittest.TestCase):
         with patch.object(main.mlflow, "log_metrics"), \
                 contextlib.redirect_stdout(io.StringIO()):
             models, optimizers, _, _, _ = main.train(
-                DataStream(input_dim=4), 20, 32, 0.01, 0.0
+                DataStream(input_dim=4), 20, 32, *main.create_comparison(4, 0.01, 0.0)
             )
         torch.testing.assert_close(models["IDBD"].weight, models["SGD"].weight)
         torch.testing.assert_close(
@@ -115,12 +192,12 @@ class TrainingTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             torch.manual_seed(1234)
             expected_models, _, history, expected_metrics, predictions = main.train(
-                DataStream(input_dim=4), 5, 3, 0.01, 0.1
+                DataStream(input_dim=4), 5, 3, *main.create_comparison(4, 0.01, 0.1)
             )
             calls = []
             torch.manual_seed(1234)
             models, _, empty_history, metrics, empty_predictions = main.train(
-                DataStream(input_dim=4), 5, 3, 0.01, 0.1,
+                DataStream(input_dim=4), 5, 3, *main.create_comparison(4, 0.01, 0.1),
                 record_history=False,
                 progress_callback=lambda step, values: calls.append((step, values)),
             )
@@ -178,7 +255,13 @@ class TrainingTests(unittest.TestCase):
             return torch.ones(input_dim), torch.tensor(float("nan")), torch.tensor(1.0)
 
         with self.assertRaisesRegex(FloatingPointError, "non-finite loss"):
-            main.train(DataStream(2, sample_fn=sample), 1, 1, 0.01, 0.1)
+            main.train(DataStream(2, sample_fn=sample), 1, 1,
+                       *main.create_comparison(2, 0.01, 0.1))
+
+    def test_tracking_uri_default_and_override(self):
+        self.assertEqual(main.parse_args([]).tracking_uri, "http://100.96.85.78:5000")
+        self.assertEqual(main.parse_args(["--tracking-uri", "sqlite:///test.db"]).tracking_uri,
+                         "sqlite:///test.db")
 
     def test_invalid_arguments(self):
         for args in (["--input-dim", "1"], ["--iterations", "0"],
@@ -199,6 +282,7 @@ class TrainingTests(unittest.TestCase):
                         "--input-dim", "4", "--iterations", "4", "--batch-size", "32",
                         "--test-iterations", "2", "--test-batch-size", "128",
                         "--log-every", "3",
+                        "--tracking-uri", f"sqlite:///{Path(directory) / 'mlflow.db'}",
                     ])
                 client = MlflowClient()
                 run = client.get_run(run_id)

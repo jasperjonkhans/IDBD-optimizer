@@ -36,7 +36,9 @@ class MomentumNotebookTests(unittest.TestCase):
                 for index, cell in enumerate(notebook.cells):
                     if cell.cell_type != "code":
                         continue
-                    exec(compile(cell.source, f"idbd_momentum.ipynb:cell{index}", "exec"), namespace)
+                    source = "\n".join(line for line in cell.source.splitlines()
+                                       if not line.startswith("%"))
+                    exec(compile(source, f"idbd_momentum.ipynb:cell{index}", "exec"), namespace)
                     if "RUN_MATCHED_META_LR = False" in cell.source:
                         namespace.update(INPUT_DIM=8, ITERATIONS=80, BATCH_SIZE=16,
                                          RECORD_EVERY=13, TEST_ITERATIONS=5,
@@ -78,7 +80,8 @@ class MomentumNotebookTests(unittest.TestCase):
                                   for name, model in result["models"].items()}
                 state_before = {name: copy.deepcopy(opt.state_dict())
                                 for name, opt in result["optimizers"].items()}
-                namespace["test_models"](result["models"], 99, 8, 3, 16)
+                namespace["evaluate"](result["models"],
+                                      namespace["DataStream"](input_dim=8, seed=99), 3, 16)
                 for name, model in result["models"].items():
                     torch.testing.assert_close(model.weight, weights_before[name], rtol=0, atol=0)
                     after = result["optimizers"][name].state_dict()

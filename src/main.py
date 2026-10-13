@@ -1,4 +1,4 @@
-"""SGD/IDBD comparison from the notebook, with local MLflow tracking."""
+"""SGD/IDBD comparison from the notebook, with MLflow tracking."""
 
 import argparse
 import copy
@@ -19,9 +19,6 @@ if __package__:
 else:  # Also support `python src/main.py`.
     from data import DataStream
     from optim import IDBD
-
-plt.switch_backend("Agg")  # Save plots without opening windows (also works headlessly).
-
 
 def metric_totals():
     return dict(examples=0, active_examples=0, noisy_sse=0.0,
@@ -74,29 +71,20 @@ def log_summary(metrics, prefix, step):
 
 
 def learning_rates(model, optimizer):
+    """Return per-feature rates, including before the first optimizer update."""
     if isinstance(optimizer, IDBD):
-        return optimizer.state[model.weight]["beta"].exp().squeeze(0)
-    return torch.full_like(model.weight.squeeze(0), optimizer.param_groups[0]["lr"])
+        state = optimizer.state.get(model.weight, {})
+        if "beta" in state:
+            return state["beta"].exp().squeeze(0)
+        lr = optimizer.param_groups[0]["initial_lr"]
+    else:
+        lr = optimizer.param_groups[0]["lr"]
+    return torch.full_like(model.weight.squeeze(0), float(lr))
 
 
-def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
-          stop_condition=None, zeros=False, *, progress_callback=None,
-          record_history=True):
-    """Train for at most ``iterations`` updates on the shared data stream.
-
-    If provided, ``stop_condition(step, name, metrics)`` is checked after each
-    optimizer update until its first True result. ``metrics`` contains the same
-    values as a history row: pre-update losses and post-update weights/rates.
-    Both models continue training until both have reached the criterion.
-    The returned training metrics then include ``steps_to_target``: the first
-    matching update, or None if not reached (also None for the Zero baseline).
-    Without a stop callback, fixed-budget behavior is unchanged.
-    ``progress_callback(step, metrics_by_model)`` receives one report per update.
-    Set ``record_history=False`` for sweeps to keep memory usage bounded; history
-    and final predictions are then empty, but training metrics are unchanged.
-    """
-    # Same random initial weights for both models, as in the notebook's train().
-    idbd_model = nn.Linear(dataset.input_dim, 1, bias=False)
+def create_comparison(input_dim, initial_lr, meta_lr, *, zeros=False):
+    """Build the default SGD/IDBD comparison with identical initial weights."""
+    idbd_model = nn.Linear(input_dim, 1, bias=False)
     if zeros:
         nn.init.zeros_(idbd_model.weight)
     models = {"IDBD": idbd_model, "SGD": copy.deepcopy(idbd_model)}
@@ -105,6 +93,39 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
                      initial_lr=initial_lr, meta_lr=meta_lr),
         "SGD": torch.optim.SGD(models["SGD"].parameters(), lr=initial_lr),
     }
+    return models, optimizers
+
+
+def train(dataset, iterations, batch_size, models, optimizers, log_every=100,
+          stop_condition=None, *, progress_callback=None,
+          record_history=True, log_mlflow=True):
+    """Train supplied models for at most ``iterations`` updates on a shared stream.
+
+    ``models`` and ``optimizers`` are nonempty mappings with matching names;
+    each optimizer must be bound to its corresponding model's parameters.
+    Models are scalar, feature-aligned linear predictors without bias (at least
+    one useful feature and one distractor). Names are arbitrary except ``Zero``,
+    which is reserved for the automatic baseline. IDBD and its subclasses receive
+    the input batch in ``step(x)``; other optimizers use ``step()``.
+    No models, optimizers or initial weights are created/reset here. The returned
+    model and optimizer mappings are the same objects supplied by the caller.
+    Set ``log_mlflow=False`` to train without an MLflow run or tracking server.
+
+    If provided, ``stop_condition(step, name, metrics)`` is checked after each
+    optimizer update until its first True result. ``metrics`` contains the same
+    values as a history row: pre-update losses and post-update weights/rates.
+    All supplied models continue training until all have reached the criterion.
+    The returned training metrics then include ``steps_to_target``: the first
+    matching update, or None if not reached (also None for the Zero baseline).
+    Without a stop callback, fixed-budget behavior is unchanged.
+    ``progress_callback(step, metrics_by_model)`` receives one report per update.
+    Set ``record_history=False`` for sweeps to keep memory usage bounded; history
+    and final predictions are then empty, but training metrics are unchanged.
+    """
+    if not models or set(models) != set(optimizers):
+        raise ValueError("models and optimizers must have matching, nonempty names")
+    if "Zero" in models:
+        raise ValueError("Zero is reserved for the automatic baseline")
     loader = DataLoader(dataset, batch_size=batch_size, num_workers=0)
     totals = {name: metric_totals() for name in (*models, "Zero")}
     history = []
@@ -129,7 +150,7 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
             predictions[name] = prediction.detach().clone()
             accumulate_metrics(totals[name], prediction, noisy_y, clean_y)
             loss.backward()
-            if name == "IDBD":
+            if isinstance(optimizer, IDBD):
                 optimizer.step(x)
             else:
                 optimizer.step()
@@ -137,10 +158,14 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
             with torch.no_grad():
                 weights = model.weight.squeeze(0)
                 rates = learning_rates(model, optimizer)
-                finite_h = (torch.isfinite(optimizer.state[model.weight]["h"]).all().item()
-                            if name == "IDBD" else True)
+                finite_state = all(
+                    torch.isfinite(value).all().item()
+                    for state in optimizer.state.values()
+                    for value in state.values()
+                    if isinstance(value, torch.Tensor)
+                )
                 if not (torch.isfinite(weights).all().item()
-                        and torch.isfinite(rates).all().item() and finite_h):
+                        and torch.isfinite(rates).all().item() and finite_state):
                     raise FloatingPointError(
                         f"{name}: non-finite optimizer state at update {step}"
                     )
@@ -178,7 +203,8 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
 
         all_reached = (stop_condition is not None
                        and all(value is not None for value in steps_to_target.values()))
-        if step == 1 or step % log_every == 0 or step == iterations or all_reached:
+        if log_mlflow and (step == 1 or step % log_every == 0
+                           or step == iterations or all_reached):
             mlflow.log_metrics(step_metrics, step=step)
             log_summary(summarize_metrics(totals), "train", step)
         if progress_callback is not None:
@@ -186,9 +212,9 @@ def train(dataset, iterations, batch_size, initial_lr, meta_lr, log_every=100,
         progress = step / iterations * 100
         if (progress_callback is None
                 and (progress >= next_report or step == iterations or all_reached)):
-            print(f"Training {progress:.0f}%: {examples_seen} examples, "
-                  f"IDBD loss={step_metrics['train.IDBD.loss']:.4f}, "
-                  f"SGD loss={step_metrics['train.SGD.loss']:.4f}")
+            losses = ", ".join(f"{name} loss={values['loss']:.4f}"
+                               for name, values in metrics_by_model.items())
+            print(f"Training {progress:.0f}%: {examples_seen} examples, {losses}")
             next_report = (int(progress) // 10 + 1) * 10
         if all_reached:
             break
@@ -262,8 +288,10 @@ def log_plots(models, history, predictions, test_metrics):
     mlflow.log_figure(fig, "plots/training.png")
     plt.close(fig)
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True, sharey=True,
+    fig, axes = plt.subplots(len(models), 1, figsize=(12, 3 * len(models)),
+                             sharex=True, sharey=True, squeeze=False,
                              constrained_layout=True)
+    axes = axes[:, 0]
     for ax, name in zip(axes, models):
         ax.plot(predictions["example"], predictions[name], alpha=0.8,
                 label=f"{name}: pre-update prediction")
@@ -299,7 +327,7 @@ def parse_args(argv=None):
     parser.add_argument("--test-batch-size", type=int, default=128)
     parser.add_argument("--log-every", type=int, default=100,
                         help="Log metrics every N updates; CSVs/plots include every update")
-    parser.add_argument("--tracking-uri", default="sqlite:///mlflow.db")
+    parser.add_argument("--tracking-uri", default="http://100.96.85.78:5000")
     parser.add_argument("--experiment", default="SGD-vs-IDBD")
     args = parser.parse_args(argv)
     if args.input_dim < 2:
@@ -318,11 +346,12 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    plt.switch_backend("Agg")  # CLI plots are saved headlessly; imports leave notebooks alone.
     torch.manual_seed(args.seed)
     mlflow.set_tracking_uri(args.tracking_uri)
     mlflow.set_experiment(args.experiment)
 
-    # One run contains the full comparison; no server needed during training.
+    # One run contains the full comparison.
     with mlflow.start_run() as run:
         params = vars(args).copy()
         params.update(test_seed=args.seed + 1, loss="mean half-squared error",
@@ -330,9 +359,12 @@ def main(argv=None):
                       feature_probability=0.01, impulse_probability=0.01,
                       noise_variance=5, loss_ma_window=200, prediction_window=500)
         mlflow.log_params(params)
+        models, optimizers = create_comparison(
+            args.input_dim, args.initial_lr, args.meta_lr,
+        )
         models, optimizers, history, train_metrics, predictions = train(
             DataStream(input_dim=args.input_dim, seed=args.seed),
-            args.iterations, args.batch_size, args.initial_lr, args.meta_lr, args.log_every,
+            args.iterations, args.batch_size, models, optimizers, args.log_every,
         )
         test_metrics = evaluate(
             models, DataStream(input_dim=args.input_dim, seed=args.seed + 1),

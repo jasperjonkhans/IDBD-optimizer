@@ -38,6 +38,11 @@ class SweepTests(unittest.TestCase):
         os.chdir(self.previous_cwd)
         self.directory.cleanup()
 
+    def test_tracking_uri_default_and_override(self):
+        self.assertEqual(sweep.parse_args([]).tracking_uri, "http://100.96.85.78:5000")
+        self.assertEqual(sweep.parse_args(self.argv).tracking_uri,
+                         f"sqlite:///{Path(self.directory.name) / 'mlflow.db'}")
+
     def test_nested_runs_csv_and_shared_training_api(self):
         with contextlib.redirect_stdout(io.StringIO()), \
                 patch.object(main, "train", wraps=main.train) as train, \
@@ -46,7 +51,9 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(train.call_count, 2)
         self.assertEqual(evaluate.call_count, 2)
         self.assertFalse(train.call_args.kwargs["record_history"])
-        self.assertFalse(train.call_args.kwargs["zeros"])
+        self.assertEqual(set(train.call_args.kwargs["models"]), {"IDBD", "SGD"})
+        self.assertEqual(set(train.call_args.kwargs["optimizers"]), {"IDBD", "SGD"})
+        self.assertNotIn("zeros", train.call_args.kwargs)
         self.assertIsNone(mlflow.active_run())
         client = MlflowClient()
         parent = client.get_run(parent_id)
@@ -75,11 +82,13 @@ class SweepTests(unittest.TestCase):
                 for metric in ("clean_mse", "noisy_mse", "half_squared_loss"):
                     self.assertAlmostEqual(row[metric], child.data.metrics[f"test.{name}.{metric}"])
             lr = float(child.data.params["initial_lr"])
-            # Compare against main's default API with the same initialization/data.
+            # Compare against the shared API with the same initialization/data.
             with patch.object(main.mlflow, "log_metrics"), \
                     contextlib.redirect_stdout(io.StringIO()):
                 torch.manual_seed(1234)
-                models, _, _, _, _ = main.train(DataStream(4), 4, 8, lr, 0)
+                models, _, _, _, _ = main.train(
+                    DataStream(4), 4, 8, *main.create_comparison(4, lr, 0)
+                )
             expected = main.evaluate(models, DataStream(4, seed=1235), 2, 64)
             for _, row in rows.iterrows():
                 self.assertAlmostEqual(row["clean_mse"], expected.loc[row["model"], "clean_mse"])
